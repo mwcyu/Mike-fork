@@ -1,3 +1,4 @@
+import OpenAI from "openai";
 import type {
     LlmMessage,
     NormalizedToolCall,
@@ -6,34 +7,20 @@ import type {
     StreamChatParams,
     StreamChatResult,
 } from "./types";
+import {
+    runStreamingLoop,
+    type ProviderSession,
+    type TurnContext,
+    type TurnResult,
+} from "./driver";
 
-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const MAX_OUTPUT_TOKENS = 16384;
 
+// The Responses API input is either a chat-style message or a tool-call
+// result. We only ever feed it these two shapes.
 type ResponseInputItem =
     | { role: "user" | "assistant"; content: string }
     | { type: "function_call_output"; call_id: string; output: string };
-
-type ResponseFunctionTool = {
-    type: "function";
-    name: string;
-    description?: string;
-    parameters: Record<string, unknown>;
-};
-
-type ResponseFunctionCallItem = {
-    type: "function_call";
-    call_id?: string;
-    name?: string;
-    arguments?: string;
-};
-
-type ResponseStreamEvent = {
-    type?: string;
-    delta?: string;
-    response?: { id?: string; output_text?: string };
-    item?: ResponseFunctionCallItem;
-};
 
 function apiKey(override?: string | null): string {
     const key = override?.trim() || process.env.OPENAI_API_KEY?.trim() || "";
@@ -45,12 +32,19 @@ function apiKey(override?: string | null): string {
     return key;
 }
 
-function toResponseTools(tools: OpenAIToolSchema[]): ResponseFunctionTool[] {
+function client(override?: string | null): OpenAI {
+    return new OpenAI({ apiKey: apiKey(override) });
+}
+
+function toResponseTools(
+    tools: OpenAIToolSchema[],
+): OpenAI.Responses.Tool[] {
     return tools.map((tool) => ({
         type: "function",
         name: tool.function.name,
         description: tool.function.description,
         parameters: tool.function.parameters,
+        strict: false,
     }));
 }
 
@@ -61,32 +55,11 @@ function toResponseInput(messages: LlmMessage[]): ResponseInputItem[] {
     }));
 }
 
-function extractSseJson(buffer: string): { events: unknown[]; rest: string } {
-    const events: unknown[] = [];
-    const chunks = buffer.split(/\n\n/);
-    const rest = chunks.pop() ?? "";
-
-    for (const chunk of chunks) {
-        const dataLines = chunk
-            .split("\n")
-            .map((line) => line.trim())
-            .filter((line) => line.startsWith("data:"))
-            .map((line) => line.slice(5).trim());
-
-        for (const data of dataLines) {
-            if (!data || data === "[DONE]") continue;
-            try {
-                events.push(JSON.parse(data));
-            } catch {
-                // Incomplete events stay buffered until the next read.
-            }
-        }
-    }
-
-    return { events, rest };
-}
-
-function parseFunctionCall(item: ResponseFunctionCallItem): NormalizedToolCall {
+function parseFunctionCall(item: {
+    call_id?: string;
+    name?: string;
+    arguments?: string;
+}): NormalizedToolCall {
     let input: Record<string, unknown> = {};
     try {
         const parsed = JSON.parse(item.arguments || "{}");
@@ -104,156 +77,128 @@ function parseFunctionCall(item: ResponseFunctionCallItem): NormalizedToolCall {
     };
 }
 
-async function createResponse(params: {
-    model: string;
-    input: ResponseInputItem[];
-    instructions?: string;
-    tools?: ResponseFunctionTool[];
-    stream?: boolean;
-    maxTokens?: number;
-    previousResponseId?: string;
-    reasoningSummary?: boolean;
-    apiKey: string;
-}): Promise<Response> {
-    const response = await fetch(OPENAI_RESPONSES_URL, {
-        method: "POST",
-        headers: {
-            Authorization: `Bearer ${params.apiKey}`,
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-            model: params.model,
-            instructions: params.instructions || undefined,
-            input: params.input,
-            tools: params.tools?.length ? params.tools : undefined,
-            stream: params.stream,
-            max_output_tokens: params.maxTokens ?? MAX_OUTPUT_TOKENS,
-            previous_response_id: params.previousResponseId,
-            reasoning: params.reasoningSummary
-                ? { summary: "auto" }
-                : undefined,
-        }),
-    });
-
-    if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        const err = new Error(
-            `OpenAI request failed (${response.status}): ${text || response.statusText}`,
-        );
-        (err as { status?: number }).status = response.status;
-        throw err;
-    }
-
-    return response;
-}
-
-export async function streamOpenAI(
-    params: StreamChatParams,
-): Promise<StreamChatResult> {
+function createOpenAISession(params: StreamChatParams): ProviderSession {
     const {
         model,
         systemPrompt,
         tools = [],
-        callbacks = {},
         runTools,
         apiKeys,
         enableThinking,
+        enableWebSearch,
     } = params;
-    const maxIter = params.maxIterations ?? 10;
-    const key = apiKey(apiKeys?.openai);
+    const openai = client(apiKeys?.openai);
     const responseTools = toResponseTools(tools);
-    let input = toResponseInput(params.messages);
-    let previousResponseId: string | undefined;
-    let fullText = "";
+    // `hasTools` (which drives the pre-tool preamble buffering) keys off
+    // *function* tools only — the native web_search tool is server-executed
+    // and doesn't produce a function-call preamble, so it's appended
+    // separately and left out of that gate.
     const hasTools = responseTools.length > 0;
+    const requestTools: OpenAI.Responses.Tool[] = [
+        ...responseTools,
+        ...(enableWebSearch
+            ? [{ type: "web_search" } as OpenAI.Responses.Tool]
+            : []),
+    ];
 
-    for (let iter = 0; iter < maxIter; iter++) {
-        const response = await createResponse({
+    // Conversation state is carried server-side via `previous_response_id`;
+    // after the first turn `input` only carries fresh tool outputs.
+    let input: ResponseInputItem[] = toResponseInput(params.messages);
+    let previousResponseId: string | undefined;
+
+    async function runTurn(ctx: TurnContext): Promise<TurnResult> {
+        const { callbacks } = ctx;
+        // The SDK returns a typed async iterable of SSE events — no manual
+        // fetch/TextDecoder/buffer parsing required. Conversation state is
+        // carried server-side via `previous_response_id`, so after the first
+        // turn we only send fresh input (tool outputs) and let the prior
+        // context (including instructions) persist.
+        const stream = await openai.responses.create({
             model,
-            instructions: iter === 0 ? systemPrompt : undefined,
-            input,
-            tools: responseTools,
+            instructions: ctx.iter === 0 ? systemPrompt : undefined,
+            input: input as OpenAI.Responses.ResponseInput,
+            tools: requestTools.length ? requestTools : undefined,
             stream: true,
-            previousResponseId,
-            reasoningSummary: !!enableThinking,
-            apiKey: key,
+            max_output_tokens: MAX_OUTPUT_TOKENS,
+            previous_response_id: previousResponseId,
+            reasoning: enableThinking ? { summary: "auto" } : undefined,
         });
-        if (!response.body) throw new Error("OpenAI response had no body");
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
         const toolCalls: NormalizedToolCall[] = [];
         const startedToolCallIds = new Set<string>();
-        let buffer = "";
+        let turnText = "";
         let pendingText = "";
         let sawReasoning = false;
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const extracted = extractSseJson(buffer);
-            buffer = extracted.rest;
-
-            for (const event of extracted.events as ResponseStreamEvent[]) {
-                if (event.response?.id) {
+        for await (const event of stream) {
+            switch (event.type) {
+                case "response.created":
                     previousResponseId = event.response.id;
-                }
+                    break;
 
-                if (
-                    event.type === "response.reasoning_summary_text.delta" &&
-                    typeof event.delta === "string"
-                ) {
+                case "response.reasoning_summary_text.delta":
                     sawReasoning = true;
                     callbacks.onReasoningDelta?.(event.delta);
-                }
+                    break;
 
-                if (
-                    event.type === "response.output_text.delta" &&
-                    typeof event.delta === "string"
-                ) {
+                case "response.output_text.delta":
+                    // When tools are in play we buffer text and only flush it
+                    // once we know the model isn't going to call a tool — a
+                    // tool-calling turn shouldn't surface partial prose.
                     if (hasTools) {
                         pendingText += event.delta;
                     } else {
-                        fullText += event.delta;
+                        turnText += event.delta;
                         callbacks.onContentDelta?.(event.delta);
                     }
-                }
+                    break;
 
-                if (
-                    event.type === "response.output_item.added" &&
-                    event.item?.type === "function_call"
-                ) {
-                    const call = parseFunctionCall(event.item);
-                    startedToolCallIds.add(call.id);
-                    callbacks.onToolCallStart?.(call);
-                }
-
-                if (
-                    event.type === "response.output_item.done" &&
-                    event.item?.type === "function_call"
-                ) {
-                    const call = parseFunctionCall(event.item);
-                    if (!startedToolCallIds.has(call.id)) {
+                case "response.output_item.added":
+                    if (event.item.type === "function_call") {
+                        const call = parseFunctionCall(event.item);
+                        startedToolCallIds.add(call.id);
                         callbacks.onToolCallStart?.(call);
+                    } else if (event.item.type === "web_search_call") {
+                        // Native web search runs server-side; surface it as a
+                        // search indicator rather than a tool call.
+                        const action = (
+                            event.item as { action?: { query?: string } }
+                        ).action;
+                        callbacks.onWebSearch?.(action?.query);
                     }
-                    toolCalls.push(call);
-                }
+                    break;
+
+                case "response.output_item.done":
+                    if (event.item.type === "function_call") {
+                        const call = parseFunctionCall(event.item);
+                        if (!startedToolCallIds.has(call.id)) {
+                            callbacks.onToolCallStart?.(call);
+                        }
+                        toolCalls.push(call);
+                    }
+                    break;
             }
         }
 
+        // OpenAI fires onToolCallStart mid-stream (above) and onReasoningBlockEnd
+        // after the stream — preserving the provider's callback ordering.
         if (sawReasoning) callbacks.onReasoningBlockEnd?.();
 
-        if (!toolCalls.length || !runTools) {
-            if (pendingText) {
-                fullText += pendingText;
-                callbacks.onContentDelta?.(pendingText);
-            }
-            break;
+        // Buffered preamble text is surfaced only when this turn isn't going to
+        // run tools; in a tool-using turn it is dropped (neither streamed nor
+        // counted in fullText). Mirrors the driver's break condition.
+        if ((!toolCalls.length || !runTools) && pendingText) {
+            turnText += pendingText;
+            callbacks.onContentDelta?.(pendingText);
         }
 
-        const results = await runTools(toolCalls);
+        return { toolCalls, textForFullText: turnText };
+    }
+
+    function recordToolResults(
+        _calls: NormalizedToolCall[],
+        results: NormalizedToolResult[],
+    ): void {
         input = results.map((result) => ({
             type: "function_call_output",
             call_id: result.tool_use_id,
@@ -261,7 +206,13 @@ export async function streamOpenAI(
         }));
     }
 
-    return { fullText };
+    return { runTurn, recordToolResults };
+}
+
+export async function streamOpenAI(
+    params: StreamChatParams,
+): Promise<StreamChatResult> {
+    return runStreamingLoop(params, createOpenAISession);
 }
 
 export async function completeOpenAIText(params: {
@@ -271,29 +222,14 @@ export async function completeOpenAIText(params: {
     maxTokens?: number;
     apiKeys?: { openai?: string | null };
 }): Promise<string> {
-    const response = await createResponse({
+    const openai = client(params.apiKeys?.openai);
+    const response = await openai.responses.create({
         model: params.model,
         instructions: params.systemPrompt,
-        input: [{ role: "user", content: params.user }],
-        maxTokens: params.maxTokens ?? 512,
-        apiKey: apiKey(params.apiKeys?.openai),
+        input: params.user,
+        max_output_tokens: params.maxTokens ?? 512,
     });
-    const json = (await response.json()) as {
-        output_text?: string;
-        output?: {
-            content?: { type?: string; text?: string }[];
-        }[];
-    };
-
-    if (typeof json.output_text === "string") return json.output_text;
-
-    return (
-        json.output
-            ?.flatMap((item) => item.content ?? [])
-            .filter((content) => content.type === "output_text")
-            .map((content) => content.text ?? "")
-            .join("") ?? ""
-    );
+    return response.output_text ?? "";
 }
 
 export type { NormalizedToolResult };
